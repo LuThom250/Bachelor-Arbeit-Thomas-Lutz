@@ -221,7 +221,7 @@ def run_pinn_simulation():
 # -------------------------------------------------
 # Hyperparamter für Symbolic Policy with Reinforcement Learning
 # -------------------------------------------------
-MAX_LENGTH    = 15      # Maximale Token-Länge eines Ausdrucks
+MAX_LENGTH    = 15      # Maximale Token-Länge eines Ausdrucks, odt auch 12
 X_RANGE       = (0, L)  # Betrachtung des Intervalls, muss mit L übereinstimmen
 N_POINTS      = 50      # Anzahl x-Stützstellen pro Episode
 EPISODES      = 10000   # Gesamtzahl RL-Episoden, standard 10000
@@ -791,71 +791,61 @@ class SymbolicRegressionEnv:
         return False
 
 
-# -------------------------------------------------
-# POLICY NETWORK
-# -------------------------------------------------
+# ERSETZEN: Die komplette PolicyNetwork-Klasse
 
 class PolicyNetwork(nn.Module):
     def __init__(self, vocab_size, embed_size=EMBED_SIZE, hidden_size=HIDDEN_SIZE):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_size)
+        self.embed = nn.Embedding(vocab_size, embed_size, padding_idx=0)
         self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, vocab_size - 1)  # -1 because we don't select PAD
 
         # Initialize weights
-        nn.init.zeros_(self.embed.weight[0])  # Zero for padding
         for param in self.lstm.parameters():
             if param.dim() > 1:
                 nn.init.xavier_uniform_(param)
-            else:
-                nn.init.zeros_(param)
         nn.init.xavier_uniform_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
 
     def forward(self, seq):
-        """Berechnet Aktions-Logits für eine Token-Sequenz (Embedding → LSTM → Linear)."""
-        # Behandle verschiedene Eingabeformate
-        if isinstance(seq, torch.Tensor):
-            if seq.dim() > 2:  # Wenn es ein Batch mit mehr als 2 Dimensionen ist
-                batch_size = seq.size(0)
-                # Reshape auf 2D für LSTM
-                reshaped = seq.reshape(batch_size, -1)
-                embedded = self.embed(reshaped)
-                output, (hidden, _) = self.lstm(embedded)
-                return self.fc(hidden.squeeze(0))
-            else:
-                t = seq
-        else:
-            # Originaler Code für Listen-Eingabe
-            t = torch.LongTensor(seq).unsqueeze(0)
+        """
+        Berechnet Aktions-Logits für einen Batch von Token-Sequenzen.
+        Diese Methode verarbeitet jetzt korrekt einzelne Sequenzen und Batches.
+        """
+        # Sicherstellen, dass der Input ein LongTensor ist.
+        if not isinstance(seq, torch.Tensor):
+            seq = torch.LongTensor(seq)
+        # Wenn nur eine Sequenz (z.B. bei Aktionsauswahl) übergeben wird,
+        # fügen wir eine Batch-Dimension hinzu.
+        if seq.dim() == 1:
+            seq = seq.unsqueeze(0)
 
-        seq_list = t.tolist()[0] if t.dim() > 1 else t.tolist()
+        # Embedding -> LSTM
+        # output shape: (batch_size, seq_len, hidden_size)
+        output, (hidden, _) = self.lstm(self.embed(seq))
 
-        # Find sequence length (up to padding or end)
-        seq_len = seq_list.index(0) if 0 in seq_list else len(seq_list)
+        # Wir nehmen den letzten Hidden State jeder Sequenz im Batch.
+        # output[:, -1, :] hat die Form (batch_size, hidden_size)
+        last_hidden_state = output[:, -1, :]
 
-        if seq_len == 0:
-            # Handle empty sequence
-            h = torch.zeros((1, self.lstm.hidden_size))
-        else:
-            # Process through LSTM
-            embedded = self.embed(t[:, :seq_len] if t.dim() > 1 else t[:seq_len])
-            output, (hidden, _) = self.lstm(embedded)
-            h = output[:, -1, :] if output.dim() > 2 else output[:, -1]
-
-        # Final logits
-        return self.fc(h).squeeze(0)
+        # Linear Layer zur Berechnung der Logits
+        # output shape: (batch_size, vocab_size - 1)
+        logits = self.fc(last_hidden_state)
+        
+        return logits
 
     def select_action(self, seq, valid_actions=None):
         """Wählt nach Policy oder Zufall eine gültige nächste Aktion aus."""
         with torch.no_grad():
-            logits = self.forward(seq)
+            # Die forward-Methode gibt jetzt immer einen 2D-Tensor zurück,
+            # daher .squeeze(0) für den Fall einer einzelnen Aktion.
+            logits = self.forward(seq).squeeze(0)
 
             # Apply mask if valid_actions are provided
             if valid_actions is not None:
-                mask = torch.zeros_like(logits)
-                mask[valid_actions] = 1
-                masked_logits = logits + (mask - 1) * 1e9  # Large negative value for invalid actions
+                mask = torch.full_like(logits, -float('inf'))
+                mask[valid_actions] = 0
+                masked_logits = logits + mask
                 dist = torch.distributions.Categorical(logits=masked_logits)
             else:
                 dist = torch.distributions.Categorical(logits=logits)
@@ -884,9 +874,10 @@ class ReplayBuffer:
 # -------------------------------------------------
 # TRAINER
 # -------------------------------------------------
+# ERSETZEN: Die komplette DSPTrainer-Klasse
 class DSPTrainer:
     def __init__(self, target_fn, allowed_operators=None, episodes=EPISODES, lr=LR,
-                entropy_coef=ENTROPY_COEF, batch_size=BATCH_SIZE):
+                 entropy_coef=ENTROPY_COEF, batch_size=BATCH_SIZE):
         self.env = SymbolicRegressionEnv(target_fn, allowed_operators=allowed_operators)
         self.model = PolicyNetwork(self.env.vocab_size)
         self.target_model = PolicyNetwork(self.env.vocab_size)
@@ -899,243 +890,149 @@ class DSPTrainer:
         self.batch_size = batch_size
         self.entropy_coef = entropy_coef
         self.steps_done = 0
-        self.baseline = None
+        
+        # Erweiterte Attribute zum Sammeln von Daten für die Analyse
         self.history = []
-        self.best_expr = None
-        self.best_reward = float('-inf')
+        self.entropy_history = []
+        self.action_probs_history = []
+        self.prob_log_epochs = []
+        self.top_solutions = []
+        self.seen_expressions = set()
+        
+        # Frequenz für das Loggen der Wahrscheinlichkeiten
+        self.PROB_LOG_FREQ = 250
 
     def get_valid_actions(self, required_operands):
         """Liefert zulässige Token-IDs basierend auf der aktuellen Ausdrucksstruktur."""
         valid_actions = []
-
-        # Always allow binary operations if we have at least one operand
         if required_operands > 0:
-            valid_actions.extend(self.env.binary_ops)
-
-            # Only add unary operators if not inside a restricted function
             if not self.env._is_inside_restricted_function():
                 valid_actions.extend(self.env.unary_ops)
-
-        # Allow terminals if we need operands
-        if required_operands > 0:
-            # If the last token is ^ (power), only allow constants as exponents
-            if len(self.env.tokens) > 0 and self.env.tokens[-1] == self.env.TOK_POW:
-                valid_actions.append(self.env.TOK_CONST)  # Only constants allowed as exponents
-            else:
+            valid_actions.extend(self.env.binary_ops)
+            if len(self.env.tokens) == 0 or self.env.tokens[-1] != self.env.TOK_POW:
                 valid_actions.extend(self.env.terminals)
-
-        # Convert to indices for the PolicyNetwork (subtract 1 because tokens start at 1)
-        return [a - 1 for a in valid_actions]
+            else:
+                valid_actions.append(self.env.TOK_CONST)
+        return list(set([a - 1 for a in valid_actions])) # Indizes für das Netzwerk
 
     def select_action(self, state, required_operands):
-        """Epsilon-greedy Wahl einer Aktion samt Log-Wahrscheinlichkeit und Entropie."""
+        """Epsilon-greedy Wahl einer Aktion."""
         epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * math.exp(-self.steps_done / EPSILON_DECAY)
         self.steps_done += 1
-
-        # Get valid actions
         valid_actions = self.get_valid_actions(required_operands)
+        if not valid_actions: return None, None, None
 
-        if random.random() < epsilon or not valid_actions:
-            # Random action
-            action = random.choice(valid_actions or [self.env.TOK_X - 1, self.env.TOK_CONST -1]) + 1 # Fallback
+        if random.random() < epsilon:
+            action = random.choice(valid_actions) + 1
             return action, None, None
         else:
-            # Policy-based action
             return self.model.select_action(state, valid_actions)
 
     def optimize_model(self):
         """Aktualisiert die Policy-Gewichte mithilfe von Replay-Samples (DQN-ähnlich)."""
-        if len(self.memory) < self.batch_size:
-            return
-
-        # Sample batch
+        if len(self.memory) < self.batch_size: return
         batch = self.memory.sample(self.batch_size)
         state_batch, action_batch, next_state_batch, reward_batch, done_batch = zip(*batch)
 
-        # Convert to tensors with correct format
         state_tensor = torch.LongTensor(state_batch)
-        next_state_tensor = torch.LongTensor(next_state_batch)
-        action_tensor = torch.LongTensor([a - 1 for a in action_batch])  # Adjusted - no need for extra dimension
+        action_tensor = torch.LongTensor([a - 1 for a in action_batch]).unsqueeze(1)
         reward_tensor = torch.FloatTensor(reward_batch)
+        next_state_tensor = torch.LongTensor(next_state_batch)
         done_tensor = torch.FloatTensor(done_batch)
 
-        # Current Q values - ensure proper shape for gather operation
-        logits = self.model(state_tensor)
-        # Check if logits are 1D or 2D
-        if logits.dim() == 1:
-            # If 1D, we need to handle a single sample case
-            current_q_values = logits[action_tensor]
-        else:
-            # If 2D (batch, actions), use gather on dim 1
-            current_q_values = logits.gather(1, action_tensor.unsqueeze(1)).squeeze(1)
-
-        # Compute target Q values with target network
+        current_q_values = self.model(state_tensor).gather(1, action_tensor)
         with torch.no_grad():
-            next_logits = self.target_model(next_state_tensor)
-            if next_logits.dim() == 1:
-                next_q_values = next_logits.max()
-            else:
-                next_q_values = next_logits.max(1)[0]
-            target_q_values = reward_tensor + GAMMA * next_q_values * (1 - done_tensor)
-
-        # Compute loss
+            next_q_values = self.target_model(next_state_tensor).max(1)[0]
+            target_q_values = (reward_tensor + GAMMA * next_q_values * (1 - done_tensor)).unsqueeze(1)
+        
         loss = F.smooth_l1_loss(current_q_values, target_q_values)
-
-        # Optimize
         self.optimizer.zero_grad()
         loss.backward()
-
-        # Gradient clipping with check for None gradients
-        for param in self.model.parameters():
-            if param.grad is not None:  # Check if gradient exists
-                param.grad.data.clamp_(-GRAD_CLIP, GRAD_CLIP)
-
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP)
         self.optimizer.step()
 
-        return loss.item()
-
-
     def update_target_network(self):
-        """Kopiert Gewichte vom Policy- auf das Target-Netz für stabilere Q-Schätzungen."""
         self.target_model.load_state_dict(self.model.state_dict())
 
-    def train(self):
-        """Führt das komplette RL-Training über alle Episoden hinweg aus."""
-        for episode in enhanced_progress_bar(range(1, self.episodes + 1), desc="SR+RL Training", unit=" Ep."):
-            # Reset environment
-            state = self.env.reset()
-            episode_reward = 0.0
-
-            # Episode loop
-            while not self.env.done:
-                # Select action
-                action, log_prob, entropy = self.select_action(state, self.env.required_operands)
-
-                # Take step in environment
-                next_state, reward, done, info = self.env.step(action)
-                episode_reward += reward
-
-                # Store in replay buffer
-                self.memory.add(state, action, next_state, reward, done)
-
-                # Move to next state
-                state = next_state
-
-            # Optimize constants for completed expressions with constants
-            if self.env.done and info.get('expr') and self.env.tokens.count(self.env.TOK_CONST) > 0:
-                best_reward_opt = episode_reward
-                best_constants = self.env.constants.copy()
-                
-                # Try optimization
-                if self.env.optimize_constants():
-                    new_reward = self.env._calculate_reward()
-                    if new_reward > best_reward_opt:
-                        best_reward_opt = new_reward
-                        best_constants = self.env.constants.copy()
-
-                self.env.constants = best_constants
-                episode_reward = best_reward_opt
-                info['expr'] = self.env.get_expression_str()
-
-            # Update best expression if better
-            if episode_reward > self.best_reward:
-                self.best_reward = episode_reward
-                self.best_expr = info.get('expr')
-
-                # Ausmultiplizieren des besten Ausdrucks
-                if self.best_expr:
-                    simplified_expr = self.simplify_expression(self.best_expr)
-                    if simplified_expr:  # Falls die Vereinfachung erfolgreich war
-                        self.best_expr = simplified_expr
-
-                if self.best_expr:
-                    print_highlighted(f"\nEpisode {episode}/{self.episodes} – Neuer bester Ausdruck: {self.best_expr} | Reward: {self.best_reward:.3f}", Fore.GREEN)
-
-            # Store episode reward
-            self.history.append(episode_reward)
-
-            # Optimize model
-            if episode % POLICY_UPDATE_FREQ == 0 and len(self.memory) >= self.batch_size:
-                self.optimize_model()
-
-            # Update target network
-            if episode % TARGET_UPDATE_FREQ  == 0:
-                self.update_target_network()
-
-        self.optimize_best_expression()
-        return self.best_expr, self.best_reward
+    def _update_top_solutions(self, reward, expr):
+        """Hält eine Liste der Top-3-Lösungen aktuell."""
+        if expr is None or expr in self.seen_expressions: return
+        self.seen_expressions.add(expr)
+        if len(self.top_solutions) < 3:
+            self.top_solutions.append((reward, expr))
+        elif reward > self.top_solutions[-1][0]:
+            self.top_solutions[-1] = (reward, expr)
+        self.top_solutions.sort(key=lambda x: x[0], reverse=True)
 
     def simplify_expression(self, expr_str):
-        """Multipliziert einen Algebra-Ausdruck aus und vereinfacht ihn (sympy)."""
-        if not expr_str:
-            return None
+        if not expr_str: return None
         try:
-            # Ersetze ^ durch ** für Python-Kompatibilität
-            expr_str_py = expr_str.replace('^', '**')
-            # Definiere das Symbol x
             x = sp.Symbol('x')
-            # Konvertiere den String in einen sympy-Ausdruck
-            expr = sp.sympify(expr_str_py, locals={'sin': sp.sin, 'cos': sp.cos, 'exp': sp.exp})
-            # Ausmultiplizieren und vereinfachen
-            expanded_expr = sp.expand(expr)
-            # Umwandlung zurück in String und ** wieder durch ^ ersetzen
-            expanded_str = str(expanded_expr).replace('**', '^')
-            return expanded_str
-        except Exception as e:
-            # print(f"Fehler beim Vereinfachen des Ausdrucks: {e}")
-            return expr_str  # Gib den ursprünglichen Ausdruck zurück, wenn ein Fehler auftritt
+            expr_py = expr_str.replace('^', '**')
+            expr = sp.sympify(expr_py, locals={'sin': sp.sin, 'cos': sp.cos, 'exp': sp.exp})
+            return str(sp.expand(expr)).replace('**', '^')
+        except Exception: return expr_str
 
+    def train(self):
+        """Führt das RL-Training aus und sammelt Daten für die Analyse."""
+        for episode in enhanced_progress_bar(range(1, self.episodes + 1), desc="SR+RL Training", unit=" Ep."):
+            state = self.env.reset()
+            episode_reward, entropies = 0.0, []
+            
+            while not self.env.done:
+                action, log_prob, entropy = self.select_action(state, self.env.required_operands)
+                if action is None: break
+                if entropy is not None: entropies.append(entropy.item())
 
-    def optimize_best_expression(self):
-        """Startet nach dem Training eine zusätzliche Konstanten-Optimierung."""
-        if not self.best_expr:
-            return
-        print_highlighted("\nStarte finale Konstantenoptimierung für den besten Ausdruck...", Fore.YELLOW)
-        try:
-            # Create a dummy environment to evaluate the best expression
-            temp_env = SymbolicRegressionEnv(self.env.target_fn)
-            
-            # Simple tokenization of the best expression
-            # This is a placeholder for a more robust RPN conversion if needed
-            # For now, we extract constants and rebuild
-            
-            # Find constants in the string
-            constants = [float(num) for num in re.findall(r'[-+]?\d*\.?\d+', self.best_expr)]
-            
-            # Replace numbers with a placeholder to identify structure
-            structure_str = re.sub(r'[-+]?\d*\.?\d+', 'C', self.best_expr)
+                next_state, reward, done, info = self.env.step(action)
+                episode_reward += reward
+                self.memory.add(state, action, next_state, reward, done)
+                state = next_state
 
-            # This part is complex: converting infix string back to prefix tokens
-            # For this code, we will rely on the optimize_constants method with the
-            # final expression's constants as a starting point.
+            if self.env.done and info.get('expr') and self.env.tokens.count(self.env.TOK_CONST) > 0:
+                if self.env.optimize_constants():
+                    episode_reward = self.env._calculate_reward()
+                    info['expr'] = self.env.get_expression_str()
+
+            if info.get('expr'):
+                simplified_expr = self.simplify_expression(info.get('expr'))
+                self._update_top_solutions(episode_reward, simplified_expr)
+
+            self.history.append(episode_reward)
+            if entropies: self.entropy_history.append(np.mean(entropies))
+
+            if episode % POLICY_UPDATE_FREQ == 0: self.optimize_model()
+            if episode % TARGET_UPDATE_FREQ == 0: self.update_target_network()
             
-            # Since rebuilding the token list is tricky, let's just re-run the optimization
-            # on the environment state that produced the best expression. This is simpler.
-            self.env.tokens = self.tokenize_from_str(self.best_expr) # A helper function is needed here
-            if self.env.tokens and self.env.optimize_constants():
-                self.best_expr = self.env.get_expression_str()
-                self.best_reward = self.env._calculate_reward()
-                simplified_expr = self.simplify_expression(self.best_expr)
-                if simplified_expr:
-                    self.best_expr = simplified_expr
-                print_highlighted(f"Finale Optimierung verbesserte Reward auf: {self.best_reward:.3f}", Fore.GREEN)
-        except Exception as e:
-            print(f"Fehler bei finaler Optimierung: {e}")
-            
-    def tokenize_from_str(self, expr_str):
-        # This is a simplified helper and might not cover all cases.
-        # A full parser (e.g., Shunting-yard) would be more robust.
-        # For now, we return an empty list to avoid breaking the flow.
-        return []
+            # Loggen der Aktionswahrscheinlichkeiten
+            if episode % self.PROB_LOG_FREQ == 0:
+                self.prob_log_epochs.append(episode)
+                with torch.no_grad():
+                    logits = self.model([self.env.TOK_PAD] * self.env.max_length)
+                    probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
+                    self.action_probs_history.append(probs)
+
+        return self.top_solutions
 
 # -------------------------------------------------
 # WRAPPER FUNCTIONS
 # -------------------------------------------------
-def optimize_expression(target_fn, allowed_operators=None, episodes=EPISODES):
-    """Startet den DSPTrainer und liefert besten Symbolic-Ausdruck + Reward."""
+# ERSETZEN: Die optimize_expression Funktion
+def optimize_and_analyze_expression(target_fn, allowed_operators, episodes, run_name):
+    """
+    Startet den DSPTrainer, führt die Analyse-Plots aus und liefert die besten
+    gefundenen symbolischen Ausdrücke zurück.
+    """
     trainer = DSPTrainer(target_fn, allowed_operators=allowed_operators, episodes=episodes)
-    best_expr, best_reward = trainer.train()
-    return best_expr, best_reward
+    top_solutions = trainer.train()
+
+    # Nach dem Training die Analyse-Plots für diesen Lauf anzeigen
+    print_highlighted(f"\n--- Analysediagramme für Lauf: {run_name} ---", Fore.YELLOW)
+    plot_reward_history(trainer.history, run_name)
+    plot_entropy_history(trainer.entropy_history, run_name)
+    plot_action_prob_heatmap(trainer.action_probs_history, trainer.prob_log_epochs, trainer.env, run_name)
+    
+    return top_solutions
 
 def calculate_mse(target_fn, expr_str, x_range=(0, L), n_points=200):
     """Berechnet den MSE zwischen Ziel- und Symbolic-Funktion auf gemeinsamem Gitter."""
@@ -1183,7 +1080,55 @@ def calculate_mse(target_fn, expr_str, x_range=(0, L), n_points=200):
     except Exception as e:
         # print(f"Error calculating MSE for '{expr_str}': {e}") # Zur Fehlersuche einkommentieren
         return float('inf')
+# HINZUFÜGEN: Import für die Heatmap
+import seaborn as sns
 
+# HINZUFÜGEN: Neue Plotting-Funktionen
+def moving_average(data, window_size):
+    """Berechnet den gleitenden Durchschnitt."""
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+
+def plot_reward_history(history, run_name):
+    """Plottet den Reward-Verlauf mit gleitendem Durchschnitt."""
+    plt.figure(figsize=(12, 6))
+    plt.plot(history, label='Reward pro Episode', alpha=0.5)
+    if len(history) > 100:
+        avg = moving_average(history, 100)
+        plt.plot(np.arange(99, len(history)), avg, color='red', linewidth=2, label='Gleitender Durchschnitt (100 Ep.)')
+    plt.title(f'Reward-Verlauf - {run_name}')
+    plt.xlabel('Episode')
+    plt.ylabel('Gesamt-Reward')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_entropy_history(entropy_history, run_name):
+    """Plottet den Verlauf der Policy-Entropie."""
+    plt.figure(figsize=(12, 6))
+    plt.plot(entropy_history, label='Durchschnittliche Entropie pro Episode', alpha=0.6)
+    if len(entropy_history) > 100:
+        avg = moving_average(entropy_history, 100)
+        plt.plot(np.arange(99, len(entropy_history)), avg, color='green', linewidth=2, label='Gleitender Durchschnitt (100 Ep.)')
+    plt.title(f'Policy-Entropie-Verlauf - {run_name}')
+    plt.xlabel('Episode')
+    plt.ylabel('Entropie')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_action_prob_heatmap(action_probs, epochs, env, run_name):
+    """Stellt die Aktionswahrscheinlichkeiten als Heatmap dar."""
+    if not action_probs: return
+    # Sicherstellen, dass alle Token-Namen vorhanden sind
+    action_labels = [env.token_str.get(i, f"UNK_{i}") for i in range(1, env.vocab_size)]
+    
+    plt.figure(figsize=(14, 8))
+    sns.heatmap(np.array(action_probs), cmap='viridis', xticklabels=action_labels, yticklabels=epochs)
+    plt.title(f'Heatmap der Aktionswahrscheinlichkeiten - {run_name}')
+    plt.xlabel('Aktion (Token)')
+    plt.ylabel('Episode')
+    plt.xticks(rotation=45)
+    plt.show()
 
 # -------------------------------------------------
 # MAIN EXECUTION BLOCK
@@ -1234,79 +1179,28 @@ if __name__ == "__main__":
     results = {}
     plot_data = []
 
+    # ANPASSEN: Die Schleife im Main-Block
+    results = {}
+    plot_data = []
+
     for i, (name, fn, operators) in enumerate(TARGET_FUNCTIONS):
         print_highlighted(f"\n=== Starte SR+RL Lauf {i+1}/4: {name} ===", Fore.YELLOW)
-        print(f"Zulässige Operatoren: {operators}")
         
-        best_expr, reward = optimize_expression(fn, allowed_operators=operators, episodes=EPISODES)
-        mse = calculate_mse(fn, best_expr)
+        # Aufruf der neuen, erweiterten Funktion
+        top_solutions = optimize_and_analyze_expression(fn, allowed_operators=operators, episodes=EPISODES, run_name=name)
+        
+        if top_solutions:
+            # Das beste Ergebnis ist das erste in der sortierten Liste
+            best_reward, best_expr = top_solutions[0]
+            mse = calculate_mse(fn, best_expr)
 
-        print_highlighted(f"→ Bester gefundener Ausdruck: {best_expr}", Fore.LIGHTGREEN_EX)
-        print(f"→ Reward: {reward:.4f}")
-        print(f"→ MSE: {mse:.6g}")
+            print_highlighted(f"→ Bester gefundener Ausdruck: {best_expr}", Fore.LIGHTGREEN_EX)
+            print(f"→ Reward: {best_reward:.4f}")
+            print(f"→ MSE: {mse:.6g}")
 
-        run_name = f"Lauf {i+1}"
-        results[run_name] = (best_expr, reward, mse, ' '.join(operators))
-        plot_data.append((fn, best_expr, name, mse))
-
-    # --- Zusammenfassung der SR+RL Ergebnisse ---
-    print_highlighted("\n\n=== Zusammenfassung der Symbolischen Regression ===", Fore.CYAN)
-    table_data = []
-    headers = ["Lauf", "Operatoren", "Bester Ausdruck", "Reward", "MSE"]
-    for name, (expr, reward, mse, ops) in results.items():
-        table_data.append([name, ops, expr if expr else "Fehlgeschlagen", f"{reward:.3f}", f"{mse:.6g}"])
-    print(tabulate(table_data, headers=headers, tablefmt="grid"))
-
-
-    # --- Kombinierter Plot aller SR+RL Ergebnisse ---
-    plt.figure(figsize=(15, 12))
-    plt.suptitle("Phase 2: Ergebnisse der Symbolischen Regression", fontsize=16, y=1.02)
-
-    # --- Kombinierter Plot aller SR+RL Ergebnisse ---
-# ... (Code davor) ...
-
-    for i, (target_fn, expr_str, run_name, mse) in enumerate(plot_data, 1):
-        ax = plt.subplot(2, 2, i)
-        x_plot = torch.linspace(0, L, 200)
-        y_true = [target_fn(xi.item()) for xi in x_plot]
-
-        ax.plot(x_plot.numpy(), y_true, '-', color='black', label="PINN-Ziel", linewidth=2.5)
-
-        if expr_str:
-            try:
-                # === KORREKTUR HIER (analog zu oben) ===
-                safe_math_dict = {'sin': math.sin, 'cos': math.cos, 'exp': math.exp}
-                expr_py = expr_str.replace('^', '**')
-                
-                y_pred_vals = []
-                for xi in x_plot:
-                    safe_math_dict['x'] = xi.item()
-                    y_pred_vals.append(eval(expr_py, {"__builtins__": {}}, safe_math_dict))
-                
-                ax.plot(x_plot.numpy(), y_pred_vals, '--', color='red', label=f"SR-Formel", linewidth=2)
-                # === ENDE DER KORREKTUR ===
-            except Exception:
-                pass # Fehlerhafte Ausdrücke nicht plotten
-
-        ax.set_title(f"{run_name}\n MSE: {mse:.6g}")
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("u(x) [m]")
-        ax.legend()
-        ax.grid(True, alpha=0.4)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
-    
-    # --- Ergebnisse in Datei speichern ---
-    with open('symbolic_regression_results.txt', 'w') as f:
-        f.write("Ergebnisse der Symbolischen Regression\n")
-        f.write("=======================================\n\n")
-        for name, (expr, reward, mse, ops) in results.items():
-            f.write(f"Lauf: {name}\n")
-            f.write(f"Operatoren: {ops}\n")
-            f.write(f"Approximation: {expr if expr else 'Fehlgeschlagen'}\n")
-            f.write(f"Reward: {reward:.4f}\n")
-            f.write(f"MSE: {mse:.6g}\n\n")
-    print_highlighted("\nAlle Ergebnisse wurden in 'symbolic_regression_results.txt' gespeichert.", Fore.CYAN)
-
-    # Alle erstellten Plots anzeigen
-    plt.show()
+            run_name = f"Lauf {i+1}"
+            results[run_name] = (best_expr, best_reward, mse, ' '.join(operators))
+            plot_data.append((fn, best_expr, name, mse))
+        else:
+            print_highlighted(f"→ Für '{name}' wurde keine gültige Lösung gefunden.", Fore.RED)
+            results[f"Lauf {i+1}"] = ("Fehlgeschlagen", 0, float('inf'), ' '.join(operators))
