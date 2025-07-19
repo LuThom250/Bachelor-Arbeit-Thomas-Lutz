@@ -20,18 +20,18 @@ import seaborn as sns
 sys.setrecursionlimit(10000)
 
 # -------------------------------------------------
-# Problem­parameter DGL
+# Problem­parameter DGL (Balken)
 # -------------------------------------------------
-E  = 100.0   # Elastizitätsmodul
-A  = 1.0     # Querschnittsfläche
-q0 = 10.0    # Belastungskonstante
-L  = 5.0     # Stablänge
-bc_weight = 0.5  # Gewichtung der Randbedingungen im Verlust
+E = 150e9   # Elastizitätsmodul in Pa
+I = 4e-6    # Flächenträgheitsmoment in m^4
+q = 60e3    # Gleichlast in N/m
+L = 2.5     # Balkenlänge in m
+bc_weight = 1 # Gewichtung der Randbedingungen im Verlust
 
 # -------------------------------------------------
 # Wichtige Hyperparameter RL & Symbolic Regression
 # -------------------------------------------------
-MAX_LENGTH    = 12
+MAX_LENGTH    = 17    # Etwas mehr Länge für das Polynom 4. Grades
 X_RANGE       = (0, L)
 N_POINTS      = 50
 EPISODES      = 20000
@@ -53,8 +53,8 @@ GRAD_CLIP     = 1.0
 BONUS_SCALE   = 0.1
 
 # Konstantenoptimierung
-CONST_DECIMALS = 4
-CONST_RANGE = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 5.0, -5.0, 10.0, -10.0]
+CONST_DECIMALS = 5 # Höhere Genauigkeit für die Koeffizienten
+CONST_RANGE = [1.0, -1.0, 0.5, -0.5, 2.0, -2.0, 5.0, -5.0, 10.0, -10.0, L]
 MAXITER_OPT    = 50
 
 # -------------------------------------------------
@@ -90,14 +90,14 @@ class SymbolicRegressionEnv:
         self.terminals = [self.TOK_X, self.TOK_CONST]
         self.vocab_size = len(self.token_str)
         self.reset()
-    
+
     def reset(self):
         self.tokens, self.constants = [], []
         self.required_operands, self.steps, self.done = 1, 0, False
         self.x_values_np = np.linspace(self.x_range[0], self.x_range[1], self.n_points)
         self.prev_normalized_loss = None
         return [self.TOK_PAD] * self.max_length
-    
+
     def step(self, action_token):
         if self.done: raise RuntimeError("step() called after episode is done")
         self.steps += 1
@@ -120,12 +120,11 @@ class SymbolicRegressionEnv:
                 except Exception: reward, info['expr'] = -10.0, None
             else: reward, info['expr'] = -10.0, None
         return self._pad_obs(), reward, self.done, info
-    
+
     def _pad_obs(self):
         return self.tokens + [self.TOK_PAD] * (self.max_length - len(self.tokens))
 
     def _get_full_expr_str(self, const_override=None):
-        # KORREKTUR: Der Parser wird in einen Try-Except-Block gehüllt, um Abstürze zu verhindern.
         try:
             temp_constants = const_override if const_override is not None else self.constants
             const_idx = 0
@@ -147,43 +146,77 @@ class SymbolicRegressionEnv:
             return expr
         except (IndexError, ValueError, TypeError):
             return None
-        
+
+# Ersetze die Funktion in SymbolicRegressionEnv
+
     def _calculate_physics_loss(self, const_override=None):
         try:
             expr_str = self._get_full_expr_str(const_override)
-            if expr_str is None: return 1e10 # Parser hat versagt
+            if expr_str is None: return 1e10
 
             x_sym = sp.Symbol('x')
             u_sym = sp.sympify(expr_str.replace('^', '**'))
-            u_prime_sym = sp.diff(u_sym, x_sym)
-            u_double_sym = sp.diff(u_sym, x_sym, 2)
+
+            # Benötigte Ableitungen für die dimensionslose DGL
+            u_fourth_sym = sp.diff(u_sym, x_sym, 4) # Für die DGL u'''' = 1
+            u_double_sym = sp.diff(u_sym, x_sym, 2) # Für die Randbedingungen u''(0), u''(1)
+
+            # Numerische Funktionen erstellen
             u_func = sp.lambdify(x_sym, u_sym, 'numpy')
-            u_d_func = sp.lambdify(x_sym, u_prime_sym, 'numpy')
             u_dd_func = sp.lambdify(x_sym, u_double_sym, 'numpy')
+            u_xxxx_func = sp.lambdify(x_sym, u_fourth_sym, 'numpy')
+
+            # WICHTIG: Wir rechnen jetzt auf dem dimensionslosen Bereich [0, 1]
+            x_values_norm = np.linspace(0.0, 1.0, self.n_points)
+
             with np.errstate(all='ignore'):
-                u_dd_vals = u_dd_func(self.x_values_np)
-                residual = A * E * u_dd_vals + q0 * self.x_values_np
-                u0, uL_d = u_func(0.0), u_d_func(L)
-            if u_dd_vals is None or np.any(np.isnan(residual)) or np.any(np.isinf(residual)) or np.iscomplexobj(residual) or \
-               np.iscomplex(u0) or np.iscomplex(uL_d) or math.isnan(u0) or math.isnan(uL_d): return 1e10
+                # 1. DGL-Residual berechnen: u'''' - 1 = 0
+                u_xxxx_vals = u_xxxx_func(x_values_norm)
+                # Das Residual ist jetzt viel einfacher und stabiler
+                residual = u_xxxx_vals - 1.0
+
+                # 2. Randbedingungen auswerten (am Rand des [0, 1] Intervalls)
+                u0 = u_func(0.0)
+                u1 = u_func(1.0) # bei x_norm = 1
+                u0_dd = u_dd_func(0.0)
+                u1_dd = u_dd_func(1.0) # bei x_norm = 1
+
+            # Auf ungültige Werte prüfen (bleibt gleich)
+            if u_xxxx_vals is None or np.any(np.isnan(residual)) or np.any(np.isinf(residual)) or \
+               np.iscomplexobj(residual) or np.iscomplex(u0) or np.iscomplex(u1) or \
+               np.iscomplex(u0_dd) or np.iscomplex(u1_dd) or math.isnan(u0) or math.isnan(u1) or \
+               math.isnan(u0_dd) or math.isnan(u1_dd):
+                return 1e10
+
+            # 3. Verlust berechnen
             mse_res = float(np.mean(np.real(residual)**2))
-            bc_loss = u0**2 + uL_d**2
+            # Vier Randbedingungen auf dem [0, 1] Intervall
+            bc_loss = u0**2 + u1**2 + u0_dd**2 + u1_dd**2
+
+            # Der bc_weight kann jetzt viel effektiver sein. Ggf. sogar erhöhen, z.B. auf 10
             return mse_res + bc_weight * bc_loss
-        except Exception: return 1e10
+        except Exception:
+            return 1e10
+
+# Ersetze die Funktion in SymbolicRegressionEnv
 
     def _calculate_reward(self, expr_str): # expr_str ist hier nur ein Trigger
         total_loss = self._calculate_physics_loss()
         if total_loss >= 1e9: return -10.0
-        scale = np.mean((q0 * self.x_values_np)**2) + 1e-6
-        normalized = total_loss / scale
-        base_reward = math.exp(-normalized)
+        
+        # NEUE SKALIERUNG: Da der Loss jetzt viel kleiner ist, brauchen wir keine
+        # aggressive Normalisierung mehr. 'total_loss' wirkt hier direkt als 'normalized'.
+        # Die exp-Funktion ist eine gute Wahl für Losses um 0-10.
+        base_reward = math.exp(-total_loss) 
+        
         bonus = 0.0
         if self.prev_normalized_loss is not None:
-            improvement = (self.prev_normalized_loss - normalized) / self.prev_normalized_loss if self.prev_normalized_loss > 0 else 0.0
+            # Wir verwenden 'total_loss' hier, da es die neue normalisierte Metrik ist
+            improvement = (self.prev_normalized_loss - total_loss) / self.prev_normalized_loss if self.prev_normalized_loss > 0 else 0.0
             bonus = BONUS_SCALE * max(0, min(improvement, 1))
-        self.prev_normalized_loss = normalized
+        self.prev_normalized_loss = total_loss
         return base_reward + bonus
-    
+
     def get_expression_str(self):
         return self._get_full_expr_str()
 
@@ -197,7 +230,7 @@ class SymbolicRegressionEnv:
             return self._calculate_physics_loss(const_override=const_values)
 
         res = optimize.minimize(error_func, self.constants, method='L-BFGS-B', options={'maxiter': MAXITER_OPT})
-        
+
         if res.success and res.fun < initial_loss:
             self.constants = [round(c, CONST_DECIMALS) for c in res.x]
             return True
@@ -218,20 +251,14 @@ class PolicyNetwork(nn.Module):
             else: nn.init.zeros_(param)
         nn.init.xavier_uniform_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
-    
+
     def forward(self, seq):
-        # KORREKTUR: Vereinfachte und stabilere Logik für den Forward-Pass
         t = torch.LongTensor(seq) if not isinstance(seq, torch.Tensor) else seq
         if t.dim() == 1: t = t.unsqueeze(0)
         
-        # Finde die tatsächliche Länge jeder Sequenz im Batch (vor dem Padding)
         lengths = (t != self.embed.padding_idx).sum(dim=1)
-        # Handle leere Sequenzen, um Fehler zu vermeiden
         if (lengths == 0).any():
-            # Erzeuge einen Null-Tensor für die Ausgabe, falls eine Sequenz leer ist
-            # Dies ist ein Edge-Case, der aber für Stabilität sorgt
             out = torch.zeros(t.size(0), self.fc.out_features, device=t.device)
-            # Führe LSTM nur für nicht-leere Sequenzen aus
             if (lengths > 0).any():
                 non_empty_mask = lengths > 0
                 non_empty_t = t[non_empty_mask]
@@ -243,17 +270,16 @@ class PolicyNetwork(nn.Module):
             return out.squeeze(0)
 
         embedded = self.embed(t)
-        # Packen der Sequenz ist der robusteste Weg, mit variablen Längen umzugehen
         packed = nn.utils.rnn.pack_padded_sequence(embedded, lengths.cpu(), batch_first=True, enforce_sorted=False)
         _, (hidden, _) = self.lstm(packed)
         return self.fc(hidden.squeeze(0)).squeeze(0)
-    
+
     def select_action(self, seq, valid_actions=None):
         with torch.no_grad():
             logits = self.forward(seq)
             if valid_actions:
                 mask = torch.full_like(logits, -float('inf'))
-                if valid_actions: # Sicherstellen, dass die Liste nicht leer ist
+                if valid_actions:
                    mask[valid_actions] = 0.0
                 logits += mask
             dist = torch.distributions.Categorical(logits=logits)
@@ -284,7 +310,7 @@ class DSPTrainer:
         self.episodes = episodes
         self.batch_size = BATCH_SIZE
         self.steps_done = 0
-        
+
         self.history, self.entropy_history = [], []
         self.action_probs_history, self.prob_log_epochs = [], []
         self.top_solutions = []
@@ -302,7 +328,7 @@ class DSPTrainer:
             else:
                 valid.extend(self.env.terminals)
         return [a - 1 for a in list(set(valid)) if a > 0]
-    
+
     def select_action(self, state):
         epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * math.exp(-self.steps_done / EPSILON_DECAY)
         self.steps_done += 1
@@ -311,29 +337,29 @@ class DSPTrainer:
         if random.random() < epsilon:
             return random.choice(valid_actions) + 1, None, None
         return self.model.select_action(state, valid_actions)
-    
+
     def optimize_model(self):
         if len(self.memory) < self.batch_size: return
         batch = self.memory.sample(self.batch_size)
         states, actions, next_states, rewards, dones = zip(*batch)
-        
+
         state_t = torch.LongTensor(states)
         action_t = torch.LongTensor([a - 1 for a in actions]).unsqueeze(1)
         reward_t = torch.FloatTensor(rewards)
         next_state_t = torch.LongTensor(next_states)
         done_t = torch.FloatTensor(dones)
-        
+
         current_q = self.model(state_t).gather(1, action_t).squeeze(1)
         with torch.no_grad():
             next_q = self.target_model(next_state_t).max(1)[0].detach()
             target_q = reward_t + GAMMA * next_q * (1 - done_t)
-        
+
         loss = F.smooth_l1_loss(current_q, target_q)
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), GRAD_CLIP)
         self.optimizer.step()
-    
+
     def _update_top_solutions(self, reward, expr):
         if expr is None or expr in self.seen_expressions: return
         self.seen_expressions.add(expr)
@@ -348,7 +374,7 @@ class DSPTrainer:
             episode_entropies = []
             final_reward = 0
             info = {}
-            
+
             while not self.env.done:
                 action, _, entropy = self.select_action(state)
                 if action is None: break
@@ -357,13 +383,13 @@ class DSPTrainer:
                 final_reward = reward
                 self.memory.add(state, action, next_state, reward, done)
                 state = next_state
-            
+
             expr = info.get('expr')
             if expr:
                 if self.env.optimize_constants():
-                    final_reward = self.env._calculate_reward(expr)
+                    final_reward = self._calculate_reward_from_expr(expr)
                     expr = self.env.get_expression_str()
-                
+
                 simplified = self.simplify_expression(expr)
                 self._update_top_solutions(final_reward, simplified)
 
@@ -376,12 +402,18 @@ class DSPTrainer:
             if episode % 1000 == 0:
                 best_expr_so_far = self.top_solutions[0][1] if self.top_solutions else "None"
                 print(f"\nEpisode {episode}/{self.episodes}, Avg reward: {np.mean(self.history[-1000:]):.3f}, Best: {best_expr_so_far}")
-        
+
         return self.top_solutions
     
+    def _calculate_reward_from_expr(self, expr):
+        """ Recalculates reward based on the current (optimized) constants. """
+        # This function directly calls the environment's reward calculation
+        # It's a bit redundant but makes the training loop clearer
+        return self.env._calculate_reward(expr)
+
+
     def _log_action_probs(self, episode):
         self.prob_log_epochs.append(episode)
-        # KORREKTUR: Sammle Wahrscheinlichkeiten für verschiedene Zustandstypen
         prob_samples = []
         with torch.no_grad():
             # Leerer Zustand
@@ -389,21 +421,14 @@ class DSPTrainer:
             logits = self.model.forward(empty_state)
             probs = F.softmax(logits, dim=0).cpu().numpy()
             prob_samples.append(probs)
-            
-            # Zustand mit einem Token
+
+            # Zustand mit einem Token (falls binäre Operatoren vorhanden)
             if self.env.binary_ops:
                 single_state = [self.env.binary_ops[0]] + [self.env.TOK_PAD] * (self.env.max_length - 1)
                 logits = self.model.forward(single_state)
                 probs = F.softmax(logits, dim=0).cpu().numpy()
                 prob_samples.append(probs)
-            
-            # Zustand mit zwei Tokens
-            if len(self.env.binary_ops) > 0 and self.env.terminals:
-                double_state = [self.env.binary_ops[0], self.env.terminals[0]] + [self.env.TOK_PAD] * (self.env.max_length - 2)
-                logits = self.model.forward(double_state)
-                probs = F.softmax(logits, dim=0).cpu().numpy()
-                prob_samples.append(probs)
-        
+
         # Durchschnitt der Wahrscheinlichkeiten über verschiedene Zustände
         avg_probs = np.mean(prob_samples, axis=0) if prob_samples else np.zeros(self.env.vocab_size - 1)
         self.action_probs_history.append(avg_probs)
@@ -411,41 +436,59 @@ class DSPTrainer:
     def simplify_expression(self, expr_str):
         if not expr_str: return None
         try:
-            return str(sp.expand(sp.sympify(expr_str.replace('^', '**')))).replace('**', '^')
-        except: return expr_str
+            # expand() führt die Multiplikationen aus und vereinfacht den Term zu einer reinen Summe
+            simplified_expr = sp.expand(sp.sympify(expr_str.replace('^', '**')))
+            return str(simplified_expr).replace('**', '^')
+        except Exception:
+            return expr_str
 
 # -------------------------------------------------
 # MAIN-FUNKTION UND ANALYSE
 # -------------------------------------------------
 def analytic_solution(x_vals):
-    return -q0/(6*E*A) * x_vals**3 + q0*L**2/(2*E*A) * x_vals
+    # Deflection is positive/downwards
+    return (q / (24 * E * I)) * (x_vals**4 - 2 * L * x_vals**3 + L**3 * x_vals)
 
 def moving_average(data, window_size):
+    if len(data) < window_size: return []
     return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
 
 def plot_reward_history(history, run_name):
-    plt.figure(figsize=(12, 6)); plt.plot(history, label='Reward pro Episode', alpha=0.5)
-    if len(history) > 100: plt.plot(np.arange(99, len(history)), moving_average(history, 100), 'r', label='Gleitender Durchschnitt (100 Ep.)')
-    plt.title(f'Reward-Verlauf - {run_name}'); plt.xlabel('Episode'); plt.ylabel('Finaler Reward'); plt.legend(); plt.grid(True); plt.show()
+    plt.figure(figsize=(12, 6))
+    plt.plot(history, label='Reward pro Episode', alpha=0.5)
+    mv_avg = moving_average(history, 100)
+    if len(mv_avg) > 0:
+        plt.plot(np.arange(99, len(history)), mv_avg, 'r', label='Gleitender Durchschnitt (100 Ep.)')
+    plt.title(f'Reward-Verlauf - {run_name}')
+    plt.xlabel('Episode')
+    plt.ylabel('Finaler Reward')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 def plot_entropy_history(entropy_history, run_name):
-    plt.figure(figsize=(12, 6)); plt.plot(entropy_history, label='Durchschnittliche Entropie', alpha=0.6)
-    if len(entropy_history) > 100: plt.plot(np.arange(99, len(entropy_history)), moving_average(entropy_history, 100), 'g', label='Gleitender Durchschnitt (100 Ep.)')
-    plt.title(f'Policy-Entropie-Verlauf - {run_name}'); plt.xlabel('Episode'); plt.ylabel('Entropie'); plt.legend(); plt.grid(True); plt.show()
+    plt.figure(figsize=(12, 6))
+    plt.plot(entropy_history, label='Durchschnittliche Entropie', alpha=0.6)
+    mv_avg = moving_average(entropy_history, 100)
+    if len(mv_avg) > 0:
+        plt.plot(np.arange(99, len(entropy_history)), mv_avg, 'g', label='Gleitender Durchschnitt (100 Ep.)')
+    plt.title(f'Policy-Entropie-Verlauf - {run_name}')
+    plt.xlabel('Episode')
+    plt.ylabel('Entropie')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 def plot_action_prob_heatmap(action_probs, epochs, env, run_name):
     if not action_probs: return
-    action_labels = [env.token_str.get(i, f"UNK_{i}") for i in range(1, env.vocab_size)]
+    action_labels = [env.token_str.get(i + 1, f"UNK_{i+1}") for i in range(env.vocab_size - 1)]
     prob_array = np.array(action_probs)
-    
-    # KORREKTUR: Normalisierung und bessere Darstellung
+
     if prob_array.shape[0] > 1:
-        # Normalisiere jede Zeile einzeln für bessere Sichtbarkeit
-        normalized_probs = prob_array / (prob_array.sum(axis=1, keepdims=True) + 1e-8)
         plt.figure(figsize=(14, 8))
-        sns.heatmap(normalized_probs, cmap='viridis', xticklabels=action_labels, 
-                   yticklabels=[f"Ep {ep}" for ep in epochs], cbar_kws={'label': 'Normalisierte Wahrscheinlichkeit'})
-        plt.title(f'Heatmap der Aktionswahrscheinlichkeiten (Durchschnitt verschiedener Zustände) - {run_name}')
+        sns.heatmap(prob_array, cmap='viridis', xticklabels=action_labels,
+                   yticklabels=[f"Ep {ep}" for ep in epochs], cbar_kws={'label': 'Durchschnittliche Wahrscheinlichkeit'})
+        plt.title(f'Heatmap der Aktionswahrscheinlichkeiten - {run_name}')
         plt.xlabel('Aktion (Token)')
         plt.ylabel('Episode')
         plt.tight_layout()
@@ -454,44 +497,100 @@ def plot_action_prob_heatmap(action_probs, epochs, env, run_name):
         print(f"Nicht genügend Daten für Heatmap in {run_name}")
 
 def plot_result(expr_str, run_name):
+    # Die analytische Lösung bleibt im Original-Koordinatensystem
     x_np = np.linspace(X_RANGE[0], X_RANGE[1], 200)
     y_analytic = analytic_solution(x_np)
+    
     y_pred = np.full_like(x_np, np.nan)
     if expr_str:
         try:
-            u_func = sp.lambdify(sp.Symbol('x'), sp.sympify(expr_str.replace('^', '**')), 'numpy')
-            y_pred = u_func(x_np)
-        except Exception as e: print(f"Fehler bei Auswertung: {e}")
-    plt.figure(figsize=(12, 7)); plt.plot(x_np, y_analytic, 'k-', label='Analytische Lösung', linewidth=3); plt.plot(x_np, y_pred, 'r--', label=f"Gefundene Lösung: {expr_str}", linewidth=2)
-    plt.title(f'Vergleich der Lösungen - {run_name}'); plt.xlabel('$x$'); plt.ylabel('$u(x)$'); plt.legend(); plt.grid(True, alpha=0.5); plt.show()
-    error = y_pred - y_analytic
-    plt.figure(figsize=(12, 5)); plt.plot(x_np, error, 'b-'); plt.title(f'Absoluter Fehler - {run_name}'); plt.grid(True, alpha=0.5); plt.show()
+            # u_func ist die gefundene dimensionslose Lösung u_bar(x_bar)
+            u_bar_func = sp.lambdify(sp.Symbol('x'), sp.sympify(expr_str.replace('^', '**')), 'numpy')
+            
+            # Um zu plotten, skalieren wir das Ergebnis zurück
+            x_bar_np = x_np / L                  # x -> x_bar
+            u_bar_pred = u_bar_func(x_bar_np)    # u_bar = f(x_bar)
+            
+            # Charakteristische Durchbiegung zum Zurückskalieren
+            u_c = (q * L**4) / (E * I)
+            y_pred = u_bar_pred * u_c           # u = u_bar * u_c
+
+        except Exception as e:
+            print(f"Fehler bei der Auswertung des Ausdrucks für den Plot: {e}")
+
+    plt.figure(figsize=(12, 7))
+    plt.plot(x_np, y_analytic, 'k-', label='Analytische Lösung', linewidth=3)
+    plt.plot(x_np, y_pred, 'r--', label=f"Gefundene Lösung: {expr_str}", linewidth=2)
+    plt.title(f'Vergleich der Lösungen - {run_name}')
+    plt.xlabel('$x$ [m]')
+    plt.ylabel('Durchbiegung $u(x)$ [m]')
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.show()
+
+    error = np.abs(y_pred - y_analytic)
+    plt.figure(figsize=(12, 5))
+    plt.plot(x_np, error, 'b-')
+    plt.title(f'Absoluter Fehler - {run_name}')
+    plt.xlabel('$x$ [m]')
+    plt.ylabel('Absoluter Fehler [m]')
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.show()
 
 def calculate_mse(expr_str):
     if not expr_str: return float('inf')
     try:
-        x_np = np.linspace(X_RANGE[0], X_RANGE[1], 200); y_analytic = analytic_solution(x_np)
-        u_func = sp.lambdify(sp.Symbol('x'), sp.sympify(expr_str.replace('^', '**')), 'numpy')
-        y_pred = u_func(x_np)
+        # 1. Erstelle die x-Werte und die exakte, dimensionale Lösung
+        x_np = np.linspace(X_RANGE[0], X_RANGE[1], 200)
+        y_analytic = analytic_solution(x_np)
+
+        # 2. Erstelle die Funktion für die gefundene, dimensionslose Lösung u_bar(x_bar)
+        u_bar_func = sp.lambdify(sp.Symbol('x'), sp.sympify(expr_str.replace('^', '**')), 'numpy')
+
+        # 3. Skaliere das Ergebnis zurück, um die dimensionale Vorhersage y_pred zu erhalten
+        x_bar_np = x_np / L                  # Konvertiere x in x_bar
+        u_bar_pred = u_bar_func(x_bar_np)    # Berechne u_bar
+        
+        u_c = (q * L**4) / (E * I)           # Berechne den Skalierungsfaktor
+        y_pred = u_bar_pred * u_c            # Skaliere u_bar zurück zu u (y_pred)
+
+        # 4. Prüfe auf ungültige Werte und berechne den MSE
+        if np.any(np.isnan(y_pred)) or np.any(np.isinf(y_pred)):
+             return float('inf')
         return np.mean((y_analytic - y_pred)**2)
-    except: return float('inf')
+
+    except Exception:
+        return float('inf')
 
 def run_experiment(allowed_operators=None, episodes=EPISODES, run_name=""):
     print_highlighted(f"\n=== Starte Lauf: {run_name} ===", Fore.CYAN)
     trainer = DSPTrainer(allowed_operators=allowed_operators, episodes=episodes)
     top_solutions = trainer.train()
+
     print_highlighted(f"\n--- Analysediagramme für Lauf: {run_name} ---", Fore.YELLOW)
     plot_reward_history(trainer.history, run_name)
     plot_entropy_history(trainer.entropy_history, run_name)
-    if trainer.action_probs_history: plot_action_prob_heatmap(trainer.action_probs_history, trainer.prob_log_epochs, trainer.env, run_name)
+    if trainer.action_probs_history:
+        plot_action_prob_heatmap(trainer.action_probs_history, trainer.prob_log_epochs, trainer.env, run_name)
+    
     return top_solutions
 
 if __name__ == "__main__":
     EXPERIMENT_CONFIGS = [
-        ("Lauf 1: Polynom-Operatoren", ['+', '-', '*','^']),
-        ("Lauf 2: linear Operatoren", ['+', '-', '*']),
+        ("Lauf 1 (Balken): Lineare Operatoren", ['+', '-', '*']),
+        ("Lauf 2 (Balken): Polynom-Operatoren", ['+', '-', '*', '^']),
     ]
     results = {}
+
+    print_highlighted("Parameter des physikalischen Problems (Balken):", Fore.YELLOW)
+    param_data = [
+        ["Elastizitätsmodul (E)", f"{E:.2e} Pa"],
+        ["Flächenträgheitsmoment (I)", f"{I:.2e} m^4"],
+        ["Gleichlast (q)", f"{q:.2e} N/m"],
+        ["Balkenlänge (L)", f"{L} m"]
+    ]
+    print_table(param_data)
+
     for name, operators in EXPERIMENT_CONFIGS:
         top_solutions = run_experiment(allowed_operators=operators, episodes=EPISODES, run_name=name)
         results[name] = []
@@ -500,11 +599,17 @@ if __name__ == "__main__":
                 mse = calculate_mse(expr)
                 results[name].append({'expr': expr, 'reward': reward, 'mse': mse})
             plot_result(results[name][0]['expr'], name)
-    print("\n\n" + "="*80); print_highlighted("=== ZUSAMMENFASSUNG ALLER LÄUFE ===", Fore.MAGENTA); print("="*80)
+
+    print("\n\n" + "="*80)
+    print_highlighted("=== ZUSAMMENFASSUNG ALLER LÄUFE ===", Fore.MAGENTA)
+    print("="*80)
     for name, solutions in results.items():
         print(f"\n--- {name} ---")
         if solutions:
+            # Sortiere nach MSE für eine bessere Vergleichbarkeit der Lösungsqualität
+            solutions.sort(key=lambda s: s['mse'])
             table_data = [[f"#{i+1}", s['expr'], f"{s['reward']:.4f}", f"{s['mse']:.2e}"] for i, s in enumerate(solutions)]
-            print(tabulate(table_data, headers=["Rang", "Gefundener Ausdruck", "Reward", "MSE vs. Analytisch"], tablefmt="grid"))
-        else: print("Keine Lösung gefunden.")
+            print(tabulate(table_data, headers=["Rang (nach MSE)", "Gefundener Ausdruck", "Reward", "MSE vs. Analytisch"], tablefmt="grid"))
+        else:
+            print("Keine gültige Lösung in diesem Lauf gefunden.")
     print("\n" + "="*80)
