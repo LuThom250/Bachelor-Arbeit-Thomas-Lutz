@@ -48,7 +48,7 @@ config = {
     # Training
     "lr":            1e-3,  # Lernrate
     "n_epochs":      50000,     # Anzahl der Trainings-Epochen
-    "min_error":     1e-6,     # Wenn kleiner als dieser Error Training beenden
+    "min_error":     1e-7,     # Wenn kleiner als dieser Error Training beenden
 }
 N_f            = config['N_f']                      # Kollokations­punkte (Kompromiss)
 layers         = config['layers']        # Netz­architektur (ausreichend komplex)
