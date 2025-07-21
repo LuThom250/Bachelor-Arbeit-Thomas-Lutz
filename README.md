@@ -1,4 +1,4 @@
-# Bachelor's Thesis – Symbolic Regression and Physics-Informed Modeling
+# Bachelor's Thesis – Symbolic Regression and Physics-Informed Modeling, Update necassary
 
 This repository contains the source code for my Bachelor's thesis, conducted by Thomas Lutz.  
 The thesis focuses on the development and evaluation of a novel method that combines **Symbolic Regression (SR)** with **Reinforcement Learning (RL)** to discover interpretable mathematical models.
