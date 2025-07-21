@@ -139,7 +139,7 @@ def run_scenario(scenario_name: str, params: dict):
     E, I, L, q0 = params['E'], params['I'], params['L'], params['q0']
 
     # Problem definieren
-    q_func = lambda x: q0
+    q_func = lambda x: -q0
     bcs = [
         BoundaryCondition(order=0, x0=0.0, value=0.0), BoundaryCondition(order=2, x0=0.0, value=0.0),
         BoundaryCondition(order=0, x0=L,   value=0.0), BoundaryCondition(order=2, x0=L,   value=0.0)
@@ -149,17 +149,17 @@ def run_scenario(scenario_name: str, params: dict):
 
     # Analytische Lösungen
     U = nondim_problem.U
-    analytical_func_dim = lambda x: (q0 / (24 * problem.EI)) * (x**4 - 2*L*x**3 + L**3*x)
-    C_an = np.array([-0.5, 0.0, 1.0/24.0, 0.0])
-    D_an = np.array([-q0*L/2, 0, q0*L**3/24, 0])
+    analytical_func_dim = lambda x: -(q0 / (24 * problem.EI)) * (x**4 - 2*L*x**3 + L**3*x)
+    C_an = np.array([0.5, 0.0, -1.0/24.0, 0.0])
+    D_an = np.array([q0*L/2, 0, -q0*L**3/24, 0])
 
     # Ausgabe der Formeln und Werte
     print("\n" + "="*80)
     print(f" Szenario: {scenario_name.upper()} ".center(80, "="))
     print("="*80)
     print("\n📝 Formeln und Definitionen (Balken 4. Ordnung):")
-    print(f"  - Dimensionale DGL:       EIu''''(x) = q₀")
-    print(f"  - Dimensionslose DGL:     d⁴û/dξ⁴ = 1")
+    print(f"  - Dimensionale DGL:       EIu''''(x) = -q₀")
+    print(f"  - Dimensionslose DGL:     d⁴û/dξ⁴ = -1")
     print(f"  - Skalierungsfaktor U:      U = (q₀ * L⁴) / (EI)")
     
     # Lösen
