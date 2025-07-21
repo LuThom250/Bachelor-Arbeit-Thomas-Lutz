@@ -6,7 +6,6 @@ The core of this work was to train an RL agent to build symbolic solutions for t
 
 ---
 
-
 ## 🚀 Key Findings & Contributions
 The experiments led to several key insights into the strengths and limitations of different automated discovery methods:
 
@@ -17,6 +16,8 @@ The experiments led to several key insights into the strengths and limitations o
 - **Equation vs. Black Box:** In a direct comparison, the refined SR-RL approach delivered more accurate results than a PINN for the beam problem. Crucially, it produced a transparent, symbolic equation instead of a "black box" model, enabling true scientific interpretability.
 
 - **Clear Methodological Trade-off:** The research establishes a clear trade-off: data-driven methods offer generality at the cost of precision (yielding approximate surrogates), while the refined direct approach provides exactness for problems where domain knowledge can be leveraged to ensure numerical stability.
+
+---  
 
 ## 📁 Project Structure
 The project is organized into directories, each representing a specific experimental approach. Below is a description of the most relevant scripts.
