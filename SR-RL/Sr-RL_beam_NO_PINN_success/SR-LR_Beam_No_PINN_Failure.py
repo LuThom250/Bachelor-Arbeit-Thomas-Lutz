@@ -167,7 +167,7 @@ class SymbolicRegressionEnv:
             with np.errstate(all='ignore'):
                 # 1. DGL-Residual berechnen: EI u'''' + q = 0
                 u_xxxx_vals = u_xxxx_func(self.x_values_np)
-                residual = E * I * u_xxxx_vals - q
+                residual = E * I * u_xxxx_vals + q
 
                 # 2. Randbedingungen auswerten (beidseitig gelenkig gelagert)
                 u0 = u_func(0.0)
@@ -434,8 +434,8 @@ class DSPTrainer:
 # MAIN-FUNKTION UND ANALYSE
 # -------------------------------------------------
 def analytic_solution(x_vals):
-    # Deflection is positive/downwards
-    return (q / (24 * E * I)) * (x_vals**4 - 2 * L * x_vals**3 + L**3 * x_vals)
+    # Deflection is now negative/upwards
+    return -(q / (24 * E * I)) * (x_vals**4 - 2 * L * x_vals**3 + L**3 * x_vals)
 
 def moving_average(data, window_size):
     if len(data) < window_size: return []
