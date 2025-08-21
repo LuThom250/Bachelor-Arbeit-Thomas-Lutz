@@ -29,7 +29,7 @@ BC_PENALTY_WEIGHT = 20.0  # Gewicht der BC-Penalty relativ zur Residual-MSE
 POP_SIZE = 100        # Populationsgröße
 N_GEN = 30            # Anzahl Generationen (bei __main__ verwendet)
 CX_PROB = 0.5         # Crossover-Wahrscheinlichkeit
-MUT_PROB = 0.2        # Mutations-Wahrscheinlichkeit
+MUT_PROB = 0.2       # Mutations-Wahrscheinlichkeit
 TOURNEY_SIZE = 3      # Tournament-Größe für Selektion
 
 # Initialbaum-Generierung
@@ -284,18 +284,9 @@ def simplify_sympy(expr_str):
 # ----------------------------
 def plot_comparison(best_expr, L=L):
     """
-    Plot: Analytical solution vs GP solution (raw).
+    Plot: Analytische Lösung vs GP-Lösung (roh).
     """
-    plt.rcParams.update({
-        "font.size": 20,
-        "axes.titlesize": 18,
-        "axes.labelsize": 18,
-        "legend.fontsize": 16,
-        "xtick.labelsize": 16,
-        "ytick.labelsize": 16
-    })
-
-    # Analytical solution
+    # Analytische Lösung
     u_analytic = -q0/(6*E*A) * x**3 + q0*L**2/(2*E*A) * x
     f_analytic = sp.lambdify(x, u_analytic, "numpy")
 
@@ -305,22 +296,22 @@ def plot_comparison(best_expr, L=L):
         with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
             y_best = f_best(xs_full)
     except Exception:
-        print("Could not evaluate best GP expression numerically.")
+        print("Konnte beste GP-Expression nicht numerisch auswerten.")
         return
 
     mask = np.isfinite(y_best)
     if not np.any(mask):
-        print("GP expression returns no finite values; no plot.")
+        print("GP-Ausdruck liefert keine finiten Werte; kein Plot.")
         return
 
     y_analytic = f_analytic(xs_full)
 
     plt.figure(figsize=(8, 5))
-    plt.plot(xs_full, y_analytic, label="Analytical solution", linewidth=2)
-    plt.plot(xs_full, y_best, label="GP solution", alpha=0.7)
+    plt.plot(xs_full, y_analytic, label="Analytische Lösung", linewidth=2)
+    plt.plot(xs_full, y_best, label="GP-Lösung", alpha=0.7)
     plt.xlabel("x")
     plt.ylabel("u(x)")
-    plt.title("Comparison: GP vs Analytical solution")
+    plt.title("Vergleich: GP vs Analytische Lösung")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()

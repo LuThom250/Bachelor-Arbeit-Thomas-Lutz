@@ -12,11 +12,7 @@ GLOBAL_PARAMS = {
     'line_width_methods': 2,
     'plot_alpha': 0.3,
     'xi_eval_points': 200,
-    'plot_points': 200,
-    # NEU: Schriftgrößen zentral steuern
-    'fontsize_title': 24,
-    'fontsize_labels': 22,
-    'fontsize_legend': 20
+    'plot_points': 200
 }
 
 # -----------------------------------------------------------------------------
@@ -83,6 +79,7 @@ def compute_double_integral_dim(x_array: np.ndarray, q_func: Callable) -> np.nda
         G[i] = G[i-1] + 0.5 * (Q[i] + Q[i-1]) * (x_array[i] - x_array[i-1])
     return G
 
+
 # -----------------------------------------------------------------------------
 # Optimierer-Klassen
 # -----------------------------------------------------------------------------
@@ -147,6 +144,7 @@ def run_scenario(scenario_name: str, params: dict):
     """Führt ein komplettes Szenario aus und gibt die Ergebnisse aus."""
     E, A, L, q0 = params['E'], params['A'], params['L'], params['q0']
 
+    # 1. Problem definieren
     q_func = lambda x: q0 * x
     bc1 = BoundaryCondition(order=0, x0=0.0, value=0.0)
     bc2 = BoundaryCondition(order=1, x0=L, value=0.0)
@@ -155,17 +153,44 @@ def run_scenario(scenario_name: str, params: dict):
     Q_scale = q0 * L
     nondim_problem = NondimensionalProblem(problem, Q_scale)
 
+    # Analytische Lösung
     analytical_func_nondim = lambda xi: -xi**3/6 + 0.5*xi
     U = nondim_problem.U
     analytical_func_dim = lambda x: U * analytical_func_nondim(x / L)
 
-    print(f"\n--- Scenario: {scenario_name} ---")
+    # --- Ausgabe der Formeln und Werte ---
+    print("\n" + "="*80)
+    print(f" Szenario: {scenario_name.upper()} ".center(80, "="))
+    print("="*80)
+    print("\n📝 Formeln und Definitionen:")
+    print(f"  - Dimensionale Last:      q(x) = q₀ * x   (wobei q₀ die Steigung in N/m² ist)")
+    print(f"  - Dimensionslose Last:    f(ξ) = q(Lξ)/(q₀*L) = ξ")
+    # ... (weitere Ausgaben bleiben gleich)
+
+    print("\n🔢 Berechnete Parameter für dieses Szenario:")
+    print(f"  - E = {E:.2e} Pa, A = {A:.2e} m², L = {L:.2e} m")
+    print(f"  - Last-Steigung q₀ = {q0:.2e} N/m²")
+    print(f"  - Maximale Last q(L) = {(q0*L):.2e} N/m")
+    print(f"  - Q_scale = {Q_scale:.2e} N/m")
+    print(f"  - U = {U:.6f} m")
+    
+    # 2. Lösen mit beiden Methoden
+    print("\n🚀 Lösungsversuche:")
     nondim_optimizer = NondimensionalOptimizer(nondim_problem)
     C1_opt, C2_opt = nondim_optimizer.optimize_constants()
+    print(f"  - Nicht-dimensional gefunden: C₁={C1_opt:.6f}, C₂={C2_opt:.6f} (Analytisch: C₁=0.5, C₂=0.0)")
+
+    D1_rescaled = Q_scale * L * C1_opt
+    D2_rescaled = Q_scale * L**2 * C2_opt
+    D1_analytical = Q_scale * L * 0.5
+    D2_analytical = Q_scale * L**2 * 0.0
+    print(f"  - N-D zurückskaliert:         D₁={D1_rescaled:.4e}, D₂={D2_rescaled:.4e}")
 
     dim_optimizer = DimensionalOptimizer(problem)
     D1_opt, D2_opt = dim_optimizer.optimize_constants()
+    print(f"  - Dimensional gefunden:       D₁={D1_opt:.4e}, D₂={D2_opt:.4e} (Analytisch: D₁={D1_analytical:.4e}, D₂={D2_analytical:.4e})")
 
+    # 3. Auswerten und Plotten
     x_plot = np.linspace(0, L, GLOBAL_PARAMS['plot_points'])
     xi_plot = x_plot / L
     
@@ -175,41 +200,63 @@ def run_scenario(scenario_name: str, params: dict):
     
     error_nondim = np.max(np.abs(u_nondim_scaled - u_analytical))
     error_dim = np.max(np.abs(u_dim_direct - u_analytical))
+    
+    print("\n📊 Ergebnisse und Fehler:")
+    print(f"  - Max. Fehler (Nicht-dimensional): {error_nondim:.4e} m")
+    print(f"  - Max. Fehler (Dimensional):       {error_dim:.4e} m")
+    print(f"  - Max. analytische Verschiebung:   {np.max(u_analytical):.4e} m")
 
-    # ========= Plot 1 =========
     plt.style.use('seaborn-v0_8-whitegrid')
     plt.figure(figsize=GLOBAL_PARAMS['figure_size'])
-    plt.plot(x_plot, u_analytical, 'b-', label='Analytical', 
-             linewidth=GLOBAL_PARAMS['line_width_analytical'], alpha=0.6, zorder=1)
-    plt.plot(x_plot, u_nondim_scaled, 'r--', label=f'Non-dimensional (error: {error_nondim:.2e})', 
-             linewidth=GLOBAL_PARAMS['line_width_methods'], zorder=3)
-    plt.plot(x_plot, u_dim_direct, 'g:', label=f'Dimensional (error: {error_dim:.2e})', 
-             linewidth=GLOBAL_PARAMS['line_width_methods'], zorder=3)
-    plt.title(f'Comparison of solutions - {scenario_name}', fontsize=GLOBAL_PARAMS['fontsize_title'])
-    plt.xlabel('Position x [m]', fontsize=GLOBAL_PARAMS['fontsize_labels'])
-    plt.ylabel('Displacement u(x) [m]', fontsize=GLOBAL_PARAMS['fontsize_labels'])
-    plt.legend(fontsize=GLOBAL_PARAMS['fontsize_legend'])
+    plt.plot(x_plot, u_analytical, 'b-', label='Analytische Lösung', linewidth=GLOBAL_PARAMS['line_width_analytical'], zorder=5)
+    plt.plot(x_plot, u_nondim_scaled, 'r--', label=f'Nicht-dimensional (Fehler: {error_nondim:.2e})', linewidth=GLOBAL_PARAMS['line_width_methods'])
+    plt.plot(x_plot, u_dim_direct, 'g:', label=f'Dimensional (Fehler: {error_dim:.2e})', linewidth=GLOBAL_PARAMS['line_width_methods'])
+    
+    plt.title(f'Vergleich der Lösungen - {scenario_name}')
+    plt.xlabel('Position x [m]')
+    plt.ylabel('Verschiebung u(x) [m]')
+    plt.legend()
     plt.grid(alpha=GLOBAL_PARAMS['plot_alpha'])
     plt.show()
 
-    # ========= Plot 2 =========
+    # --- NEU: ZUSÄTZLICHER PLOT FÜR DEN FEHLERVERLAUF ---
     error_nondim_array = u_nondim_scaled - u_analytical
     error_dim_array = u_dim_direct - u_analytical
+    
+    plt.style.use('seaborn-v0_8-whitegrid')
     plt.figure(figsize=GLOBAL_PARAMS['figure_size'])
-    plt.plot(x_plot, error_nondim_array, 'r-', label='Error (non-dimensional)')
-    plt.plot(x_plot, error_dim_array, 'g-', label='Error (dimensional)')
-    plt.title(f'Error over x - {scenario_name}', fontsize=GLOBAL_PARAMS['fontsize_title'])
-    plt.xlabel('Position x [m]', fontsize=GLOBAL_PARAMS['fontsize_labels'])
-    plt.ylabel('Absolute error [m]', fontsize=GLOBAL_PARAMS['fontsize_labels'])
-    plt.legend(fontsize=GLOBAL_PARAMS['fontsize_legend'])
+    plt.plot(x_plot, error_nondim_array, 'r-', label=f'Fehler (Nicht-dimensional)')
+    plt.plot(x_plot, error_dim_array, 'g-', label=f'Fehler (Dimensional)')
+    
+    plt.title(f'Fehlerverlauf der Methoden - {scenario_name}')
+    plt.xlabel('Position x [m]')
+    plt.ylabel('Absoluter Fehler [m]')
+    plt.legend()
     plt.grid(alpha=GLOBAL_PARAMS['plot_alpha'])
     plt.show()
 
+
 # -----------------------------------------------------------------------------
-# Szenarien ausführen
+# Szenarien definieren und ausführen
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    favorable_params = {'E': 100.0, 'A': 1.0, 'L': 5.0, 'q0': 2.0}
-    challenging_params = {'E': 2.1e11, 'A': 0.001, 'L': 20.0, 'q0': 2500.0}
-    run_scenario("Favorable parameters", favorable_params)
-    run_scenario("Challenging parameters", challenging_params)
+    favorable_params = {
+        'E': 100.0,
+        'A': 1.0,
+        'L': 5.0,
+        'q0': 2.0
+    }
+    
+    challenging_params = {
+        'E': 2.1e11,
+        'A': 0.001,
+        'L': 20.0,
+        'q0': 2500.0
+    }
+
+    run_scenario("Günstige Parameter", favorable_params)
+    run_scenario("Anspruchsvolle Parameter", challenging_params)
+    
+    print("\n" + "="*80)
+    print(" Analyse der Ergebnisse ".center(80, "="))
+    print("="*80)
